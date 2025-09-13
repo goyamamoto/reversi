@@ -20,7 +20,7 @@ python main.py
 - Left Click: place a disc on a valid cell
 - R: restart a new game
 - H: toggle valid-move hints
-- A: toggle simple AI for White (Black is human)
+- A: toggle Minimax AI for White (Black is human)
 - ESC or Q: quit
 
 ## Rules
@@ -31,5 +31,4 @@ python main.py
 
 ## Notes
 
-- The built-in AI is simple (greedy + corners first) and intended for casual play.
-
+- The built-in AI uses Minimax with alpha-beta pruning (default depth 3).

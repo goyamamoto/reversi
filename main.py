@@ -55,6 +55,11 @@ class Board:
         self.grid[mid - 1][mid] = BLACK
         self.grid[mid][mid - 1] = BLACK
 
+    def copy(self) -> 'Board':
+        nb = Board()
+        nb.grid = [row.copy() for row in self.grid]
+        return nb
+
     def inside(self, x: int, y: int) -> bool:
         return 0 <= x < self.size and 0 <= y < self.size
 
@@ -109,6 +114,131 @@ class SimpleAI:
         return max(moves, key=lambda m: len(m.flips))
 
 
+class MinimaxAI:
+    """Minimax with alpha-beta pruning and a positional evaluation.
+
+    Depth is measured in plies (half-moves).
+    """
+
+    POS_WEIGHTS = [
+        [100, -20, 10, 5, 5, 10, -20, 100],
+        [-20, -50, -2, -2, -2, -2, -50, -20],
+        [10, -2, 5, 1, 1, 5, -2, 10],
+        [5, -2, 1, 0, 0, 1, -2, 5],
+        [5, -2, 1, 0, 0, 1, -2, 5],
+        [10, -2, 5, 1, 1, 5, -2, 10],
+        [-20, -50, -2, -2, -2, -2, -50, -20],
+        [100, -20, 10, 5, 5, 10, -20, 100],
+    ]
+
+    CORNERS = {(0, 0), (0, BOARD_SIZE - 1), (BOARD_SIZE - 1, 0), (BOARD_SIZE - 1, BOARD_SIZE - 1)}
+
+    def __init__(self, depth: int = 3):
+        self.depth = depth
+
+    def choose(self, board: 'Board', player: int) -> Optional[Move]:
+        import math
+        best_score = -math.inf
+        best_move: Optional[Move] = None
+        moves = board.valid_moves(player)
+        if not moves:
+            return None
+
+        # simple move ordering: corners first, then by flips desc
+        def key_fn(m: Move):
+            return ((m.x, m.y) in self.CORNERS, len(m.flips))
+        moves.sort(key=key_fn, reverse=True)
+
+        for m in moves:
+            nb = board.copy()
+            nb.apply_move(m, player)
+            score = self._search(nb, opponent(player), self.depth - 1, -math.inf, math.inf, player)
+            if score > best_score:
+                best_score = score
+                best_move = m
+        return best_move
+
+    def _search(self, board: 'Board', to_move: int, depth: int, alpha: float, beta: float, root_player: int) -> float:
+        import math
+        # Terminal or depth limit
+        my_moves = board.valid_moves(to_move)
+        opp_moves = board.valid_moves(opponent(to_move))
+        if depth <= 0 or board.full() or (not my_moves and not opp_moves):
+            return self.evaluate(board, root_player)
+
+        # Handle pass
+        if not my_moves:
+            # reduce depth on pass to ensure progress
+            return self._search(board, opponent(to_move), depth - 1, alpha, beta, root_player)
+
+        # Move ordering: corners first, then flips
+        def key_fn(m: Move):
+            return ((m.x, m.y) in self.CORNERS, len(m.flips))
+        ordered = sorted(my_moves, key=key_fn, reverse=True)
+
+        if to_move == root_player:
+            value = -math.inf
+            for m in ordered:
+                nb = board.copy()
+                nb.apply_move(m, to_move)
+                value = max(value, self._search(nb, opponent(to_move), depth - 1, alpha, beta, root_player))
+                alpha = max(alpha, value)
+                if alpha >= beta:
+                    break
+            return value
+        else:
+            value = math.inf
+            for m in ordered:
+                nb = board.copy()
+                nb.apply_move(m, to_move)
+                value = min(value, self._search(nb, opponent(to_move), depth - 1, alpha, beta, root_player))
+                beta = min(beta, value)
+                if beta <= alpha:
+                    break
+            return value
+
+    def evaluate(self, board: 'Board', player: int) -> float:
+        # Disc differential (normalized)
+        b, w = board.count()
+        my = b if player == BLACK else w
+        opp = w if player == BLACK else b
+        disc_total = my + opp
+        disc_diff = 0.0 if disc_total == 0 else 100.0 * (my - opp) / disc_total
+
+        # Mobility (normalized difference of available moves)
+        my_mob = len(board.valid_moves(player))
+        opp_mob = len(board.valid_moves(opponent(player)))
+        mob_total = my_mob + opp_mob
+        mobility = 0.0 if mob_total == 0 else 100.0 * (my_mob - opp_mob) / mob_total
+
+        # Corners
+        my_corners = 0
+        opp_corners = 0
+        for (x, y) in self.CORNERS:
+            cell = board.grid[y][x]
+            if cell == player:
+                my_corners += 1
+            elif cell == opponent(player):
+                opp_corners += 1
+        corner_score = 25.0 * (my_corners - opp_corners)
+
+        # Positional weight matrix
+        pos_score = 0
+        for y in range(BOARD_SIZE):
+            for x in range(BOARD_SIZE):
+                v = board.grid[y][x]
+                if v == EMPTY:
+                    continue
+                weight = self.POS_WEIGHTS[y][x]
+                if v == player:
+                    pos_score += weight
+                elif v == opponent(player):
+                    pos_score -= weight
+
+        # Weighted sum
+        return 0.6 * pos_score + 0.2 * corner_score + 0.15 * mobility + 0.05 * disc_diff
+
+
 class Game:
     def __init__(self):
         pygame.init()
@@ -122,7 +252,7 @@ class Game:
         self.current = BLACK
         self.show_hints = True
         self.ai_enabled = True  # White plays by AI by default
-        self.ai = SimpleAI()
+        self.ai = MinimaxAI(depth=3)
         self.game_over = False
         self.message = "Black to move"
 
@@ -286,4 +416,3 @@ class Game:
 
 if __name__ == "__main__":
     Game().run()
-
