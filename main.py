@@ -1,8 +1,18 @@
+from __future__ import annotations
 import sys
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
-import pygame
+try:
+    import pygame  # type: ignore
+    HAVE_PYGAME = True
+except Exception:  # pragma: no cover - allow logic use without pygame installed
+    pygame = None
+    HAVE_PYGAME = False
+import json
+from pathlib import Path
+
+from eval_params import Params, evaluate_with_params
 
 
 # Constants
@@ -133,8 +143,9 @@ class MinimaxAI:
 
     CORNERS = {(0, 0), (0, BOARD_SIZE - 1), (BOARD_SIZE - 1, 0), (BOARD_SIZE - 1, BOARD_SIZE - 1)}
 
-    def __init__(self, depth: int = 3):
+    def __init__(self, depth: int = 3, params: Optional[Params] = None):
         self.depth = depth
+        self.params = params
 
     def choose(self, board: 'Board', player: int) -> Optional[Move]:
         import math
@@ -198,20 +209,19 @@ class MinimaxAI:
             return value
 
     def evaluate(self, board: 'Board', player: int) -> float:
-        # Disc differential (normalized)
+        # If learned parameters provided, use them; else fall back to heuristic
+        if self.params is not None:
+            return evaluate_with_params(board, player, self.params)
+        # Heuristic fallback
         b, w = board.count()
         my = b if player == BLACK else w
         opp = w if player == BLACK else b
         disc_total = my + opp
         disc_diff = 0.0 if disc_total == 0 else 100.0 * (my - opp) / disc_total
-
-        # Mobility (normalized difference of available moves)
         my_mob = len(board.valid_moves(player))
         opp_mob = len(board.valid_moves(opponent(player)))
         mob_total = my_mob + opp_mob
         mobility = 0.0 if mob_total == 0 else 100.0 * (my_mob - opp_mob) / mob_total
-
-        # Corners
         my_corners = 0
         opp_corners = 0
         for (x, y) in self.CORNERS:
@@ -221,8 +231,6 @@ class MinimaxAI:
             elif cell == opponent(player):
                 opp_corners += 1
         corner_score = 25.0 * (my_corners - opp_corners)
-
-        # Positional weight matrix
         pos_score = 0
         for y in range(BOARD_SIZE):
             for x in range(BOARD_SIZE):
@@ -234,13 +242,13 @@ class MinimaxAI:
                     pos_score += weight
                 elif v == opponent(player):
                     pos_score -= weight
-
-        # Weighted sum
         return 0.6 * pos_score + 0.2 * corner_score + 0.15 * mobility + 0.05 * disc_diff
 
 
 class Game:
     def __init__(self):
+        if not HAVE_PYGAME:
+            raise ImportError("pygame is required to run the GUI. Install with 'pip install pygame'.")
         pygame.init()
         pygame.display.set_caption("Reversi (Pygame)")
         self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
@@ -252,7 +260,20 @@ class Game:
         self.current = BLACK
         self.show_hints = True
         self.ai_enabled = True  # White plays by AI by default
-        self.ai = MinimaxAI(depth=3)
+        # Load learned parameters if available
+        params_path = Path("weights.json")
+        params = None
+        if params_path.exists():
+            try:
+                data = json.loads(params_path.read_text())
+                params = Params.from_dict(data)
+                self.message = "Loaded learned params. Black to move"
+            except Exception:
+                params = None
+        self.loaded_params: Optional[Params] = params
+        self.use_learned: bool = params is not None
+        self.depth: int = 4  # default deeper search
+        self.ai = MinimaxAI(depth=self.depth, params=(self.loaded_params if self.use_learned else None))
         self.game_over = False
         self.message = "Black to move"
 
@@ -311,7 +332,12 @@ class Game:
         msg_surface = self.big_font.render(self.message, True, TEXT_COLOR)
         turn_surface = self.font.render(turn_text, True, SUBTLE_TEXT)
         score_surface = self.font.render(score_text, True, SUBTLE_TEXT)
-        hint_surface = self.font.render(f"[H]ints: {'ON' if self.show_hints else 'OFF'}  [A]I: {'ON' if self.ai_enabled else 'OFF'}  [R]estart", True, SUBTLE_TEXT)
+        eval_mode = 'Learned' if (self.use_learned and self.loaded_params is not None) else 'Heuristic'
+        hint_surface = self.font.render(
+            f"Depth:{self.depth}  Eval:{eval_mode}   [H]ints  [A]I  [L]earned  [ [ / ] ] depth  [R]estart",
+            True,
+            SUBTLE_TEXT,
+        )
 
         self.screen.blit(msg_surface, (BOARD_MARGIN, panel_top))
         self.screen.blit(turn_surface, (BOARD_MARGIN, panel_top + 34))
@@ -343,6 +369,10 @@ class Game:
             self.after_move()
         else:
             self.message = "Invalid move"
+
+    def rebuild_ai(self):
+        # Recreate Minimax with current depth and eval mode
+        self.ai = MinimaxAI(depth=self.depth, params=(self.loaded_params if self.use_learned else None))
 
     def after_move(self):
         # switch turn or pass if needed, check game over
@@ -400,6 +430,20 @@ class Game:
                         self.show_hints = not self.show_hints
                     elif event.key == pygame.K_a:
                         self.ai_enabled = not self.ai_enabled
+                    elif event.key == pygame.K_l:
+                        # toggle learned/heuristic evaluation
+                        self.use_learned = not self.use_learned and (self.loaded_params is not None)
+                        self.rebuild_ai()
+                    elif event.key == pygame.K_LEFTBRACKET:
+                        # decrease depth
+                        if self.depth > 1:
+                            self.depth -= 1
+                            self.rebuild_ai()
+                    elif event.key == pygame.K_RIGHTBRACKET:
+                        # increase depth (cap to avoid too slow)
+                        if self.depth < 8:
+                            self.depth += 1
+                            self.rebuild_ai()
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     # Only let human act on Black by default
                     if self.current == BLACK or not self.ai_enabled:
