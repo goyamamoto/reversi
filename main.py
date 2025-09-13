@@ -12,7 +12,7 @@ except Exception:  # pragma: no cover - allow logic use without pygame installed
 import json
 from pathlib import Path
 
-from eval_params import Params, evaluate_with_params
+from eval_params import Params, evaluate_with_params, evaluate_black_advantage
 
 
 # Constants
@@ -209,9 +209,10 @@ class MinimaxAI:
             return value
 
     def evaluate(self, board: 'Board', player: int) -> float:
-        # If learned parameters provided, use them; else fall back to heuristic
+        # If learned parameters provided, use zero-sum black-fixed evaluation
         if self.params is not None:
-            return evaluate_with_params(board, player, self.params)
+            val = evaluate_black_advantage(board, self.params)
+            return val if player == BLACK else -val
         # Heuristic fallback
         b, w = board.count()
         my = b if player == BLACK else w
@@ -261,15 +262,28 @@ class Game:
         self.show_hints = True
         self.ai_enabled = True  # White plays by AI by default
         # Load learned parameters if available
-        params_path = Path("weights.json")
-        params = None
-        if params_path.exists():
+        params: Optional[Params] = None
+        # Prefer versioned latest first
+        latest = Path("weights") / "latest.json"
+        candidates = [latest, Path("weights.json")]
+        # Also consider newest file in weights/ if latest missing
+        weights_dir = Path("weights")
+        if not latest.exists() and weights_dir.exists():
             try:
-                data = json.loads(params_path.read_text())
-                params = Params.from_dict(data)
-                self.message = "Loaded learned params. Black to move"
+                newest = max((p for p in weights_dir.glob("*.json")), key=lambda p: p.stat().st_mtime, default=None)
             except Exception:
-                params = None
+                newest = None
+            if newest:
+                candidates.insert(0, newest)
+        for p in candidates:
+            if p.exists():
+                try:
+                    data = json.loads(p.read_text())
+                    params = Params.from_dict(data)
+                    self.message = f"Loaded learned params from {p.name}. Black to move"
+                    break
+                except Exception:
+                    continue
         self.loaded_params: Optional[Params] = params
         self.use_learned: bool = params is not None
         self.depth: int = 4  # default deeper search

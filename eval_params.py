@@ -101,3 +101,42 @@ def evaluate_with_params(board, player: int, params: Params) -> float:
     val += params.stable_w * count_edge_stable(board.grid, player)
     return val
 
+
+# --- Black-fixed (zero-sum) helpers ---
+def mobility_diff(board) -> int:
+    """Black legal moves minus White legal moves for the given board."""
+    try:
+        # board is our Board class instance
+        b = len(board.valid_moves(BLACK))
+        w = len(board.valid_moves(WHITE))
+    except Exception:
+        # Fallback if board lacks valid_moves
+        b = w = 0
+    return b - w
+
+
+def stable_diff(board) -> int:
+    """Black edge-stable discs minus White edge-stable discs (approximation)."""
+    return count_edge_stable(board.grid, BLACK) - count_edge_stable(board.grid, WHITE)
+
+
+def evaluate_black_advantage(board, params: Params) -> float:
+    """Return a zero-sum evaluation: positive favors Black, negative favors White.
+
+    Normalization (to match training defaults when --normalize-features is used):
+    - Positional features are scaled by 1/4 (each quadrant counts up to 4 cells)
+    - Mobility difference scaled by 1/20
+    - Edge-stable difference scaled by 1/28 (perimeter cells)
+    """
+    pos_feats_black = compute_pos_features(board.grid, BLACK)  # (Black - White)
+    # Apply default normalization consistent with training flags
+    pos_feats_black = [p / 4.0 for p in pos_feats_black]
+    mob_d = mobility_diff(board) / 20.0
+    stab_d = stable_diff(board) / 28.0
+
+    val = 0.0
+    for i in range(16):
+        val += params.pos[i] * pos_feats_black[i]
+    val += params.mobility_w * mob_d
+    val += params.stable_w * stab_d
+    return val

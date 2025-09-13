@@ -40,7 +40,7 @@ def has_changes(prev: dict[Path, float], files: list[Path]) -> bool:
 
 def run_tests(tests: str, pattern: str) -> int:
     # Use pytest to run tests; it will auto-discover under tests/
-    cmd = [sys.executable, "-m", "pytest", "-q"]
+    cmd = [sys.executable, "-m", "pytest"]
     print(f"\n[watch] Running: {' '.join(cmd)}")
     res = subprocess.run(cmd)
     print(f"[watch] Exit: {res.returncode}")
