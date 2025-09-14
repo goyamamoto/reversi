@@ -13,6 +13,28 @@ from eval_params import Params
 import train_q
 
 
+def list_final_versions(save_dir: Path) -> list[Path]:
+    """Return versioned final weights (timestamped files ending with 'ep*.json'), newest first."""
+    if not save_dir.exists():
+        return []
+    files = [p for p in save_dir.glob("weights-*ep*.json") if p.is_file()]
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return files
+
+
+def previous_final_versions(save_dir: Path, k: int = 2) -> list[Path]:
+    files = list_final_versions(save_dir)
+    # Skip the most recent (assumed current), return previous k
+    prev = files[1 : 1 + k]
+    return prev
+
+
+def previous_final_version(save_dir: Path) -> Optional[Path]:
+    files = list_final_versions(save_dir)
+    if len(files) >= 2:
+        return files[1]
+    return None
+
 @dataclass
 class TuneConfig:
     cycles: int = 5
@@ -60,6 +82,16 @@ def run_cycle(
     random_openings_eval: int,
     eval_workers: int = 1,
     progress_eval: bool = False,
+    # learning with minimax/fit-to-search
+    search_depth: int = 0,
+    search_policy: bool = False,
+    search_workers: int = 1,
+    fit_to_search: bool = False,
+    fit_cycles: int = 1,
+    max_samples: int = 2000,
+    ridge_to_current: bool = True,
+    fit_play_policy: str = "minimax",
+    fit_epsilon: float = 0.1,
 ):
     # Train for one cycle
     if progress_eval:
@@ -91,6 +123,15 @@ def run_cycle(
         resume_latest=init_weights is None,
         tag=None,
         update_root_latest=True,
+        search_depth=search_depth,
+        search_policy=search_policy,
+        search_workers=search_workers,
+        fit_to_search=fit_to_search,
+        fit_cycles=fit_cycles,
+        max_samples=max_samples,
+        ridge_to_current=ridge_to_current,
+        fit_play_policy=fit_play_policy,
+        fit_epsilon=fit_epsilon,
     )
     # Evaluate latest vs heuristic
     params = load_params_from_candidates(save_dir)
@@ -112,6 +153,7 @@ def auto_tune(cfg: TuneConfig, save_dir: Path, out_path: Path, init_weights: Opt
             f"[auto-tune] Baseline evaluating: matches={cfg.matches} depth={cfg.depth} rand_openings={cfg.random_openings_eval} workers={eval_workers}",
             flush=True,
         )
+    prev_final = previous_final_version(save_dir)
     best_res = (
         evaluate(
             best_params,
@@ -119,6 +161,7 @@ def auto_tune(cfg: TuneConfig, save_dir: Path, out_path: Path, init_weights: Opt
             cfg=EvalConfig(matches=cfg.matches, depth=cfg.depth, random_openings=cfg.random_openings_eval, swap_colors=True),
             progress=progress,
             workers=eval_workers,
+            opp_paths=[prev_final] if prev_final else None,
         )
         if best_params
         else {"win_rate": 0.0, "games": 0, "wins": 0, "losses": 0, "draws": 0}
@@ -132,7 +175,11 @@ def auto_tune(cfg: TuneConfig, save_dir: Path, out_path: Path, init_weights: Opt
         best_path = latest if latest.exists() else None
 
     last_corner_rate = 0.0
-    for i in range(1, cfg.cycles + 1):
+    i = 0
+    while True:
+        i += 1
+        if cfg.cycles > 0 and i > cfg.cycles:
+            break
         print(
             f"\n[auto-tune] Cycle {i}/{cfg.cycles}: alpha={alpha:.6f}, epsilon={epsilon:.4f}, l2={l2:.2e}",
             flush=True,
@@ -157,11 +204,34 @@ def auto_tune(cfg: TuneConfig, save_dir: Path, out_path: Path, init_weights: Opt
             random_openings_eval=cfg.random_openings_eval,
             eval_workers=eval_workers,
             progress_eval=progress,
+            search_depth=args.search_depth,
+            search_policy=args.search_policy,
+            search_workers=args.search_workers,
+            fit_to_search=args.fit_to_search,
+            fit_cycles=args.fit_cycles,
+            max_samples=args.max_samples,
+            ridge_to_current=args.ridge_to_current,
+            fit_play_policy=args.fit_play_policy,
+            fit_epsilon=args.fit_epsilon,
         )
         new_wr = res["win_rate"]
         print(f"[auto-tune] Result (pool): {res}")
         # Load latest params once for anchor and corner audit
         params_after = load_params_from_candidates(save_dir)
+        # Evaluate vs the immediately previous final version to monitor learning effect
+        prev_final = previous_final_version(save_dir)
+        if prev_final:
+            prev_eval = evaluate(
+                params_after,
+                opponent_kind="pool",
+                cfg=EvalConfig(
+                    matches=min(cfg.matches, 40), depth=cfg.depth, random_openings=cfg.random_openings_eval, swap_colors=True
+                ),
+                progress=False,
+                workers=eval_workers,
+                opp_paths=[prev_final],
+            )
+            print(f"[auto-tune] Vs previous final: {prev_final.name} -> {prev_eval}")
         # Also report vs heuristic as a stable anchor
         anchor = evaluate(
             params_after,
@@ -260,7 +330,7 @@ def auto_tune(cfg: TuneConfig, save_dir: Path, out_path: Path, init_weights: Opt
 
 def main():
     ap = argparse.ArgumentParser(description="Auto tuner: train -> evaluate -> (corner audit) -> adjust -> repeat")
-    ap.add_argument("--cycles", type=int, default=5, help="Number of train/eval cycles")
+    ap.add_argument("--cycles", type=int, default=5, help="Number of train/eval cycles (0 = loop forever)")
     ap.add_argument("--episodes", type=int, default=1000, help="Episodes per cycle")
     ap.add_argument("--save-dir", type=Path, default=Path("weights"), help="Directory to save versioned weights")
     ap.add_argument("--out", type=Path, default=Path("weights.json"), help="Root output path to update")
@@ -298,6 +368,16 @@ def main():
     ap.add_argument("--max-random-openings-train", type=int, default=12, help="Maximum random openings during training")
     ap.add_argument("--episodes-mult-on-fail", type=float, default=1.0, help="Multiply episodes per cycle when corner rate stalls (>1 to enable)")
     ap.add_argument("--eval-workers", type=int, default=1, help="Parallel workers for evaluation and corner audit")
+    # Learning with search (train_q)
+    ap.add_argument("--search-depth", type=int, default=2, help="Depth for minimax-backed targets (0 disables)")
+    ap.add_argument("--search-policy", action="store_true", help="Choose actions by minimax (with epsilon exploration)")
+    ap.add_argument("--search-workers", type=int, default=1, help="Parallel workers for minimax during training")
+    ap.add_argument("--fit-to-search", action="store_true", help="Fit linear evaluator to minimax(search-depth) targets (supervised)")
+    ap.add_argument("--fit-cycles", type=int, default=1, help="Repeat fit-to-search this many times per cycle")
+    ap.add_argument("--max-samples", type=int, default=1000, help="Max samples (states) per fit cycle")
+    ap.add_argument("--ridge-to-current", action="store_true", help="Ridge toward current weights instead of zero in fit")
+    ap.add_argument("--fit-play-policy", choices=["minimax", "epsilon", "random"], default="minimax", help="Sampling policy for fit-to-search")
+    ap.add_argument("--fit-epsilon", type=float, default=0.1, help="Exploration epsilon for sampling in fit-to-search")
     ap.add_argument("--progress", action="store_true", help="Show progress during train/eval/audit phases")
 
     args = ap.parse_args()

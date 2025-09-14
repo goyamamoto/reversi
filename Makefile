@@ -8,7 +8,7 @@ TEST_PATTERN ?= test_*.py
 # Prefer venv's python if available
 PYTHON := $(shell [ -x venv/bin/python ] && echo venv/bin/python || command -v python3 || command -v python)
 
-.PHONY: help test test-all watch coverage run train eval auto-tune clean
+.PHONY: help test test-all watch coverage run train eval auto-tune fit-loop clean
 
 help:
 	@echo "Available targets:"
@@ -21,6 +21,7 @@ help:
 	@echo "  make train-auto - Continue from latest, save versioned weights"
 	@echo "  make eval       - Evaluate latest weights vs pool/heuristic"
 	@echo "  make auto-tune  - Auto tune training/eval cycles (can stop when corner preference emerges)"
+	@echo "  make fit-loop   - Infinite loop of fit-to-search (minimax teacher)"
 	@echo "  make clean      - Remove caches and temporary files"
 
 # By default, exclude integration tests to keep 'make test' fast
@@ -72,9 +73,27 @@ eval:
 
 # Auto-tune parameters (overridable)
 AUTO_TUNE_EVAL_WORKERS ?= 1
+AUTO_TUNE_SEARCH_WORKERS ?= 6
+AUTO_TUNE_SEARCH_DEPTH ?= 2
+AUTO_TUNE_FIT_CYCLES ?= 1
+AUTO_TUNE_MAX_SAMPLES ?= 1000
 
 auto-tune:
-	PYTHONUNBUFFERED=1 $(PYTHON) auto_tuner.py --cycles 5 --episodes 1000 --normalize-features --until-corner --continue-after-corner --corner-threshold 0.7 --progress --eval-workers $(AUTO_TUNE_EVAL_WORKERS)
+	PYTHONUNBUFFERED=1 $(PYTHON) auto_tuner.py --cycles 5 --episodes 1000 --normalize-features --until-corner --continue-after-corner --corner-threshold 0.7 --progress \
+	 --eval-workers $(AUTO_TUNE_EVAL_WORKERS) --search-depth $(AUTO_TUNE_SEARCH_DEPTH) --search-workers $(AUTO_TUNE_SEARCH_WORKERS) \
+	 --fit-to-search --fit-cycles $(AUTO_TUNE_FIT_CYCLES) --max-samples $(AUTO_TUNE_MAX_SAMPLES) --ridge-to-current
+
+# Fit-to-search infinite loop with your preferred params
+FIT_LOOP_EPISODES ?= 800
+FIT_LOOP_SEARCH_DEPTH ?= 3
+FIT_LOOP_MAX_SAMPLES ?= 1000
+FIT_LOOP_RANDOM_OPENINGS ?= 6
+FIT_LOOP_SEARCH_WORKERS ?= 6
+
+fit-loop:
+	PYTHONUNBUFFERED=1 $(PYTHON) auto_tuner.py --cycles 0 --episodes $(FIT_LOOP_EPISODES) --normalize-features --progress \
+	 --eval-workers $(AUTO_TUNE_EVAL_WORKERS) --search-depth $(FIT_LOOP_SEARCH_DEPTH) --search-workers $(FIT_LOOP_SEARCH_WORKERS) \
+	 --fit-to-search --fit-cycles 1 --max-samples $(FIT_LOOP_MAX_SAMPLES) --ridge-to-current --l2 1e-4 --random-openings-train $(FIT_LOOP_RANDOM_OPENINGS)
 
 clean:
 	@find . -name "__pycache__" -type d -prune -exec rm -rf {} +

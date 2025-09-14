@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 # Reuse constants from main when imported there; mirror here for standalone usage
 BOARD_SIZE = 8
@@ -127,7 +127,30 @@ def evaluate_black_advantage(board, params: Params) -> float:
     - Positional features are scaled by 1/4 (each quadrant counts up to 4 cells)
     - Mobility difference scaled by 1/20
     - Edge-stable difference scaled by 1/28 (perimeter cells)
+
+    Additionally, encode game-over (win/loss) explicitly:
+    - If neither side has legal moves and Black has more discs, return the same
+      value as a full-Black board (and symmetric for White).
+    - Draw returns 0.
     """
+    # Encode terminal win/loss states
+    try:
+        black_moves = board.valid_moves(BLACK)
+        white_moves = board.valid_moves(WHITE)
+        is_terminal = (len(black_moves) == 0) and (len(white_moves) == 0)
+    except Exception:
+        is_terminal = False
+    if is_terminal:
+        # Count discs
+        b = sum(cell == BLACK for row in board.grid for cell in row)
+        w = sum(cell == WHITE for row in board.grid for cell in row)
+        fb = evaluate_full_black_advantage(params)
+        if b > w:
+            return fb
+        elif w > b:
+            return -fb
+        else:
+            return 0.0
     pos_feats_black = compute_pos_features(board.grid, BLACK)  # (Black - White)
     # Apply default normalization consistent with training flags
     pos_feats_black = [p / 4.0 for p in pos_feats_black]
@@ -137,6 +160,23 @@ def evaluate_black_advantage(board, params: Params) -> float:
     val = 0.0
     for i in range(16):
         val += params.pos[i] * pos_feats_black[i]
+    val += params.mobility_w * mob_d
+    val += params.stable_w * stab_d
+    return val
+
+
+def evaluate_full_black_advantage(params: Params) -> float:
+    """Value of a full-Black board (normalized features):
+    - pos_feats_black = [1]*16 (since each symmetric group has 4 cells → 4/4)
+    - mobility difference = 0
+    - edge-stable difference = 1 (28/28)
+    """
+    pos_feats = [1.0] * 16
+    mob_d = 0.0
+    stab_d = 1.0
+    val = 0.0
+    for i in range(16):
+        val += params.pos[i] * pos_feats[i]
     val += params.mobility_w * mob_d
     val += params.stable_w * stab_d
     return val

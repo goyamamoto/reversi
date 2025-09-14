@@ -3,14 +3,13 @@ import sys
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
-try:
-    import pygame  # type: ignore
-    HAVE_PYGAME = True
-except Exception:  # pragma: no cover - allow logic use without pygame installed
-    pygame = None
-    HAVE_PYGAME = False
+pygame = None  # Lazy import to avoid noisy init message during non-GUI usage
+HAVE_PYGAME = False
 import json
 from pathlib import Path
+import concurrent.futures as cf
+import os
+import random
 
 from eval_params import Params, evaluate_with_params, evaluate_black_advantage
 
@@ -46,6 +45,79 @@ DIRECTIONS = [
 
 def opponent(player: int) -> int:
     return BLACK if player == WHITE else WHITE
+
+
+def _evaluate_leaf_for_root(board: 'Board', root_player: int, params: Optional[Params]) -> float:
+    # If learned parameters provided, use black-fixed zero-sum evaluation
+    if params is not None:
+        val = evaluate_black_advantage(board, params)
+        return val if root_player == BLACK else -val
+    # Heuristic fallback (same as MinimaxAI.evaluate fallback)
+    b, w = sum(cell == BLACK for row in board.grid for cell in row), sum(
+        cell == WHITE for row in board.grid for cell in row
+    )
+    my = b if root_player == BLACK else w
+    opp = w if root_player == BLACK else b
+    disc_total = my + opp
+    disc_diff = 0.0 if disc_total == 0 else 100.0 * (my - opp) / disc_total
+    my_mob = len(board.valid_moves(root_player))
+    opp_mob = len(board.valid_moves(opponent(root_player)))
+    mob_total = my_mob + opp_mob
+    mobility = 0.0 if mob_total == 0 else 100.0 * (my_mob - opp_mob) / mob_total
+    my_corners = 0
+    opp_corners = 0
+    for (x, y) in MinimaxAI.CORNERS:
+        cell = board.grid[y][x]
+        if cell == root_player:
+            my_corners += 1
+        elif cell == opponent(root_player):
+            opp_corners += 1
+    corner_score = 25.0 * (my_corners - opp_corners)
+    pos_score = 0
+    for y in range(BOARD_SIZE):
+        for x in range(BOARD_SIZE):
+            v = board.grid[y][x]
+            if v == EMPTY:
+                continue
+            weight = MinimaxAI.POS_WEIGHTS[y][x]
+            if v == root_player:
+                pos_score += weight
+            elif v == opponent(root_player):
+                pos_score -= weight
+    return 0.6 * pos_score + 0.2 * corner_score + 0.15 * mobility + 0.05 * disc_diff
+
+
+def _search_value_standalone(
+    board: 'Board', to_move: int, depth: int, alpha: float, beta: float, root_player: int, params: Optional[Params]
+) -> float:
+    import math
+    my_moves = board.valid_moves(to_move)
+    opp_to_move = opponent(to_move)
+    opp_moves = board.valid_moves(opp_to_move)
+    if depth <= 0 or board.full() or (not my_moves and not opp_moves):
+        return _evaluate_leaf_for_root(board, root_player, params)
+    if not my_moves:
+        return _search_value_standalone(board, opp_to_move, depth - 1, alpha, beta, root_player, params)
+    if to_move == root_player:
+        value = -math.inf
+        for m in my_moves:
+            nb = board.copy()
+            nb.apply_move(m, to_move)
+            value = max(value, _search_value_standalone(nb, opp_to_move, depth - 1, alpha, beta, root_player, params))
+            alpha = max(alpha, value)
+            if alpha >= beta:
+                break
+        return value
+    else:
+        value = math.inf
+        for m in my_moves:
+            nb = board.copy()
+            nb.apply_move(m, to_move)
+            value = min(value, _search_value_standalone(nb, opp_to_move, depth - 1, alpha, beta, root_player, params))
+            beta = min(beta, value)
+            if beta <= alpha:
+                break
+        return value
 
 
 @dataclass
@@ -143,9 +215,10 @@ class MinimaxAI:
 
     CORNERS = {(0, 0), (0, BOARD_SIZE - 1), (BOARD_SIZE - 1, 0), (BOARD_SIZE - 1, BOARD_SIZE - 1)}
 
-    def __init__(self, depth: int = 3, params: Optional[Params] = None):
+    def __init__(self, depth: int = 3, params: Optional[Params] = None, workers: int = 1):
         self.depth = depth
         self.params = params
+        self.workers = max(1, int(workers))
 
     def choose(self, board: 'Board', player: int) -> Optional[Move]:
         import math
@@ -154,19 +227,40 @@ class MinimaxAI:
         moves = board.valid_moves(player)
         if not moves:
             return None
+        # Shuffle move order to avoid deterministic tie-bias (seeded upstream via random.seed)
+        random.shuffle(moves)
 
         # simple move ordering: corners first, then by flips desc
         def key_fn(m: Move):
             return ((m.x, m.y) in self.CORNERS, len(m.flips))
         moves.sort(key=key_fn, reverse=True)
 
-        for m in moves:
-            nb = board.copy()
-            nb.apply_move(m, player)
-            score = self._search(nb, opponent(player), self.depth - 1, -math.inf, math.inf, player)
-            if score > best_score:
-                best_score = score
-                best_move = m
+        # Parallelize root moves if requested
+        if self.workers > 1 and len(moves) > 1 and self.depth > 1:
+            args_list = []
+            for m in moves:
+                nb = board.copy()
+                nb.apply_move(m, player)
+                args_list.append((nb, opponent(player), self.depth - 1, -math.inf, math.inf, player, self.params))
+            with cf.ProcessPoolExecutor(max_workers=self.workers) as ex:
+                futures = {ex.submit(_search_value_standalone, *args): m for args, m in zip(args_list, moves)}
+                for fut in cf.as_completed(futures):
+                    m = futures[fut]
+                    try:
+                        score = fut.result()
+                    except Exception:
+                        continue
+                    if score > best_score:
+                        best_score = score
+                        best_move = m
+        else:
+            for m in moves:
+                nb = board.copy()
+                nb.apply_move(m, player)
+                score = self._search(nb, opponent(player), self.depth - 1, -math.inf, math.inf, player)
+                if score > best_score:
+                    best_score = score
+                    best_move = m
         return best_move
 
     def _search(self, board: 'Board', to_move: int, depth: int, alpha: float, beta: float, root_player: int) -> float:
@@ -248,8 +342,14 @@ class MinimaxAI:
 
 class Game:
     def __init__(self):
+        global pygame, HAVE_PYGAME
         if not HAVE_PYGAME:
-            raise ImportError("pygame is required to run the GUI. Install with 'pip install pygame'.")
+            try:
+                import pygame as _pygame  # type: ignore
+                pygame = _pygame
+                HAVE_PYGAME = True
+            except Exception:
+                raise ImportError("pygame is required to run the GUI. Install with 'pip install pygame'.")
         pygame.init()
         pygame.display.set_caption("Reversi (Pygame)")
         self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
@@ -281,15 +381,29 @@ class Game:
                     data = json.loads(p.read_text())
                     params = Params.from_dict(data)
                     self.message = f"Loaded learned params from {p.name}. Black to move"
+                    try:
+                        print(f"[weights] Loaded for game: {p}", flush=True)
+                    except Exception:
+                        pass
                     break
                 except Exception:
                     continue
         self.loaded_params: Optional[Params] = params
         self.use_learned: bool = params is not None
         self.depth: int = 4  # default deeper search
-        self.ai = MinimaxAI(depth=self.depth, params=(self.loaded_params if self.use_learned else None))
+        workers_env = os.getenv("MINIMAX_WORKERS", "1")
+        try:
+            workers = int(workers_env)
+        except Exception:
+            workers = 1
+        self.ai = MinimaxAI(depth=self.depth, params=(self.loaded_params if self.use_learned else None), workers=workers)
         self.game_over = False
         self.message = "Black to move"
+        if not self.use_learned:
+            try:
+                print("[weights] No learned weights found. Using heuristic evaluator.", flush=True)
+            except Exception:
+                pass
 
     def reset(self):
         self.board = Board()
@@ -338,25 +452,45 @@ class Game:
                 hint_rect = pygame.Rect(rect.left + pad, rect.top + pad, rect.width - 2 * pad, rect.height - 2 * pad)
                 pygame.draw.rect(self.screen, HINT_COLOR, hint_rect, width=2, border_radius=6)
 
-        # panel
+        # panel (wrapped text to avoid overflow)
         panel_top = BOARD_MARGIN + CELL_H * BOARD_SIZE + 10
         b_count, w_count = self.board.count()
         turn_text = f"Turn: {'Black' if self.current == BLACK else 'White'}"
-        score_text = f"Black {b_count} : {w_count} White"
-        msg_surface = self.big_font.render(self.message, True, TEXT_COLOR)
-        turn_surface = self.font.render(turn_text, True, SUBTLE_TEXT)
-        score_surface = self.font.render(score_text, True, SUBTLE_TEXT)
+        score_text = f"Score: Black {b_count} : {w_count} White"
         eval_mode = 'Learned' if (self.use_learned and self.loaded_params is not None) else 'Heuristic'
-        hint_surface = self.font.render(
-            f"Depth:{self.depth}  Eval:{eval_mode}   [H]ints  [A]I  [L]earned  [ [ / ] ] depth  [R]estart",
-            True,
-            SUBTLE_TEXT,
+        controls_text = (
+            f"Depth:{self.depth}  Eval:{eval_mode}   [H]ints  [A]I  [L]earned  [ [ / ] ] depth  [R]estart"
         )
 
-        self.screen.blit(msg_surface, (BOARD_MARGIN, panel_top))
-        self.screen.blit(turn_surface, (BOARD_MARGIN, panel_top + 34))
-        self.screen.blit(score_surface, (BOARD_MARGIN, panel_top + 56))
-        self.screen.blit(hint_surface, (BOARD_MARGIN + 300, panel_top + 34))
+        max_w = CELL_W * BOARD_SIZE
+        x = BOARD_MARGIN
+        y = panel_top
+        y = self._blit_wrapped(self.message, self.big_font, TEXT_COLOR, x, y, max_w)
+        y = self._blit_wrapped(f"{turn_text}   {score_text}", self.font, SUBTLE_TEXT, x, y + 4, max_w)
+        _ = self._blit_wrapped(controls_text, self.font, SUBTLE_TEXT, x, y + 2, max_w)
+
+    def _blit_wrapped(self, text: str, font, color, x: int, y: int, max_width: int) -> int:
+        """Render text with simple word-wrapping. Returns next y position."""
+        words = text.split()
+        if not words:
+            return y
+        line = ""
+        cur_y = y
+        for word in words:
+            test = word if not line else f"{line} {word}"
+            w, h = font.size(test)
+            if w <= max_width:
+                line = test
+            else:
+                surf = font.render(line, True, color)
+                self.screen.blit(surf, (x, cur_y))
+                cur_y += h + 2
+                line = word
+        if line:
+            surf = font.render(line, True, color)
+            self.screen.blit(surf, (x, cur_y))
+            cur_y += surf.get_height()
+        return cur_y
 
     def pos_to_cell(self, pos: Tuple[int, int]) -> Optional[Tuple[int, int]]:
         x, y = pos
