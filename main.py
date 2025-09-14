@@ -360,7 +360,12 @@ class Game:
         self.board = Board()
         self.current = BLACK
         self.show_hints = True
-        self.ai_enabled = True  # White plays by AI by default
+        # AI control per side
+        self.white_ai = True   # White plays by AI by default
+        self.black_ai = False  # Black is human by default
+        # Suggestion (AI recommended move for human side)
+        self.suggest_enabled = False
+        self.suggest_move: Optional[Move] = None
         # Load learned parameters if available
         params: Optional[Params] = None
         # Prefer versioned latest first
@@ -458,8 +463,9 @@ class Game:
         turn_text = f"Turn: {'Black' if self.current == BLACK else 'White'}"
         score_text = f"Score: Black {b_count} : {w_count} White"
         eval_mode = 'Learned' if (self.use_learned and self.loaded_params is not None) else 'Heuristic'
+        ai_mode = self._ai_mode_string() if hasattr(self, '_ai_mode_string') else 'White'
         controls_text = (
-            f"Depth:{self.depth}  Eval:{eval_mode}   [H]ints  [A]I  [L]earned  [ [ / ] ] depth  [R]estart"
+            f"Depth:{self.depth}  Eval:{eval_mode}  AI:{ai_mode}   [H]ints  [A]I-cycle  [B]/[W] toggle  [S]uggest  [ [ and ] ] depth  [R]estart"
         )
 
         max_w = CELL_W * BOARD_SIZE
@@ -468,6 +474,12 @@ class Game:
         y = self._blit_wrapped(self.message, self.big_font, TEXT_COLOR, x, y, max_w)
         y = self._blit_wrapped(f"{turn_text}   {score_text}", self.font, SUBTLE_TEXT, x, y + 4, max_w)
         _ = self._blit_wrapped(controls_text, self.font, SUBTLE_TEXT, x, y + 2, max_w)
+        # Suggestion highlight
+        if getattr(self, 'suggest_enabled', False) and not self.game_over and not self._is_ai_turn() and self.suggest_move is not None:
+            rect = self.cell_rect(self.suggest_move.x, self.suggest_move.y)
+            pad = 12
+            suggest_rect = pygame.Rect(rect.left + pad, rect.top + pad, rect.width - 2 * pad, rect.height - 2 * pad)
+            pygame.draw.rect(self.screen, (0, 200, 255), suggest_rect, width=3, border_radius=8)
 
     def _blit_wrapped(self, text: str, font, color, x: int, y: int, max_width: int) -> int:
         """Render text with simple word-wrapping. Returns next y position."""
@@ -521,6 +533,8 @@ class Game:
     def rebuild_ai(self):
         # Recreate Minimax with current depth and eval mode
         self.ai = MinimaxAI(depth=self.depth, params=(self.loaded_params if self.use_learned else None))
+        if self.suggest_enabled:
+            self._compute_suggestion()
 
     def after_move(self):
         # switch turn or pass if needed, check game over
@@ -535,6 +549,8 @@ class Game:
                 self.message = f"{'Black' if self.current == BLACK else 'White'} (opponent) had no moves — your turn again"
         else:
             self.message = f"{'Black' if self.current == BLACK else 'White'} to move"
+        if self.suggest_enabled:
+            self._compute_suggestion()
 
     def finish_game(self):
         self.game_over = True
@@ -549,18 +565,19 @@ class Game:
     def maybe_ai_move(self):
         if self.game_over:
             return
-        if self.ai_enabled and self.current == WHITE:
-            move = self.ai.choose(self.board, WHITE)
+        if self._is_ai_turn():
+            ply = self.current
+            move = self.ai.choose(self.board, ply)
             if move:
-                self.board.apply_move(move, WHITE)
+                self.board.apply_move(move, ply)
                 self.after_move()
             else:
                 # pass
-                self.current = BLACK
+                self.current = opponent(self.current)
                 if not self.board.valid_moves(self.current):
                     self.finish_game()
                 else:
-                    self.message = "White passed — Black to move"
+                    self.message = f"{'Black' if self.current == BLACK else 'White'} passed — {'Black' if self.current == BLACK else 'White'} to move"
 
     def run(self):
         while True:
@@ -577,24 +594,47 @@ class Game:
                     elif event.key == pygame.K_h:
                         self.show_hints = not self.show_hints
                     elif event.key == pygame.K_a:
-                        self.ai_enabled = not self.ai_enabled
+                        # Cycle AI control: None -> White -> Black -> Both -> None
+                        if not self.black_ai and not self.white_ai:
+                            self.white_ai = True
+                        elif self.white_ai and not self.black_ai:
+                            self.black_ai = True
+                        elif self.white_ai and self.black_ai:
+                            self.white_ai = False
+                        else:
+                            self.black_ai = False
+                        self.message = f"AI control: {self._ai_mode_string()}"
+                        if self.suggest_enabled:
+                            self._compute_suggestion()
+                    elif event.key == pygame.K_b:
+                        self.black_ai = not self.black_ai
+                        self.message = f"AI control: {self._ai_mode_string()}"
+                    elif event.key == pygame.K_w:
+                        self.white_ai = not self.white_ai
+                        self.message = f"AI control: {self._ai_mode_string()}"
+                    elif event.key == pygame.K_s:
+                        self.suggest_enabled = not self.suggest_enabled
+                        if self.suggest_enabled:
+                            self._compute_suggestion()
+                        else:
+                            self.suggest_move = None
                     elif event.key == pygame.K_l:
                         # toggle learned/heuristic evaluation
                         self.use_learned = not self.use_learned and (self.loaded_params is not None)
                         self.rebuild_ai()
-                    elif event.key == pygame.K_LEFTBRACKET:
+                    elif event.key in (pygame.K_LEFTBRACKET, pygame.K_MINUS):
                         # decrease depth
                         if self.depth > 1:
                             self.depth -= 1
                             self.rebuild_ai()
-                    elif event.key == pygame.K_RIGHTBRACKET:
+                    elif event.key in (pygame.K_RIGHTBRACKET, pygame.K_EQUALS):
                         # increase depth (cap to avoid too slow)
                         if self.depth < 8:
                             self.depth += 1
                             self.rebuild_ai()
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    # Only let human act on Black by default
-                    if self.current == BLACK or not self.ai_enabled:
+                    # Allow human to act only if current side is not AI-controlled
+                    if not self._is_ai_turn():
                         self.handle_click(event.pos)
 
             # AI move if enabled
@@ -604,6 +644,24 @@ class Game:
             self.draw_board()
             pygame.display.flip()
             self.clock.tick(60)
+
+    def _is_ai_turn(self) -> bool:
+        return (self.current == WHITE and self.white_ai) or (self.current == BLACK and self.black_ai)
+
+    def _ai_mode_string(self) -> str:
+        if self.black_ai and self.white_ai:
+            return "Both"
+        if self.black_ai:
+            return "Black"
+        if self.white_ai:
+            return "White"
+        return "None"
+
+    def _compute_suggestion(self):
+        if self._is_ai_turn() or self.game_over:
+            self.suggest_move = None
+            return
+        self.suggest_move = self.ai.choose(self.board, self.current)
 
 
 if __name__ == "__main__":
