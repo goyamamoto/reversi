@@ -1,0 +1,2 @@
+repeat 1000 python train_q.py --resume-latest --auto-version --save-dir weights --out weights.json --episodes 800 --normalize-features --search-depth 5 --fit-to-search --max-samples 1000 --ridge-to-current --l2 1e-4 --random-openings 6 --search-workers 6
+python eval_agents.py --weights weights/latest.json --opponent pool --opp-dir weights --opp-order newest --opp-skip-newest 2 --opp-limit 2 --matches-per-opp 10 --depth 5 --random-openings 4 --epsilon-move 0.05 --workers 8 --parallel process --progress
